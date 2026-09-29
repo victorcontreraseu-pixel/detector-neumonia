@@ -1,0 +1,5 @@
+streamlit>=1.40
+tensorflow>=2.16
+numpy
+pillow
+matplotlib
