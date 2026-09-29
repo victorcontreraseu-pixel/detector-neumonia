@@ -1,5 +1,5 @@
 streamlit>=1.40
-tensorflow>=2.16
+tensorflow-cpu==2.19.1
 numpy
 pillow
 matplotlib
