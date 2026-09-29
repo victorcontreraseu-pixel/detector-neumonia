@@ -1,5 +1,4 @@
-
-   import os
+import os
 import io
 from datetime import datetime
 
@@ -305,4 +304,3 @@ if st.session_state.history:
     st.subheader("📋 Historial de esta sesión")
     df = pd.DataFrame(st.session_state.history[::-1])  # más reciente primero
     st.dataframe(df, use_container_width=True, hide_index=True)
-
