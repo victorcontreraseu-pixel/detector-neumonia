@@ -44,9 +44,19 @@ st.markdown(
             padding: 1rem 1.2rem;
             border-radius: 12px;
             margin-top: 0.5rem;
+            font-size: 1.05rem;
         }
-        .result-pneumonia { background-color: #fdecea; border: 1px solid #f5c2c0; }
-        .result-normal { background-color: #eaf7ee; border: 1px solid #bfe6c9; }
+        .result-pneumonia {
+            background-color: #fdecea;
+            border: 1px solid #f5c2c0;
+            color: #7a1f1a !important;
+        }
+        .result-normal {
+            background-color: #eaf7ee;
+            border: 1px solid #bfe6c9;
+            color: #1e5c31 !important;
+        }
+        .result-card b { color: inherit; }
     </style>
     <div class="app-header">
         <h1>🫁 Detector de neumonía en radiografías de tórax</h1>
