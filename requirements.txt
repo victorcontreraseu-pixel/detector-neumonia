@@ -3,3 +3,6 @@ tensorflow-cpu==2.19.1
 numpy
 pillow
 matplotlib
+plotly
+pandas
+fpdf2
