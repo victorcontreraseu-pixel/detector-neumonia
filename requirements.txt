@@ -6,3 +6,4 @@ matplotlib
 plotly
 pandas
 fpdf2
+opencv-python-headless
