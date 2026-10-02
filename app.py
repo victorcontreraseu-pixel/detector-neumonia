@@ -85,7 +85,7 @@ def load_model(path: str):
 # Preprocesamiento: debe ser IGUAL al usado en el entrenamiento
 # ---------------------------------------------------------------
 def preprocess(image: Image.Image) -> np.ndarray:
-    image = image.convert("RGB").resize(IMG_SIZE)
+    image = image.convert("RGB").resize(IMG_SIZE, Image.BILINEAR)
     arr = np.asarray(image, dtype=np.float32) / 255.0  # rescale=1./255
     return np.expand_dims(arr, axis=0)  # (1, 224, 224, 3)
 
