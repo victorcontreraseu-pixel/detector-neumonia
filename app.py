@@ -10,7 +10,7 @@ from PIL import Image
 import matplotlib
 import cv2
 import plotly.graph_objects as go
-from fpdf import FPDF
+from fpdf import FPDF, XPos, YPos
 
 # ---------------------------------------------------------------
 # Configuración general
@@ -164,13 +164,13 @@ def generate_pdf(image: Image.Image, label: str, prob: float, threshold: float, 
     pdf = FPDF()
     pdf.add_page()
     pdf.set_font("Helvetica", "B", 16)
-    pdf.cell(0, 10, "Reporte - Detector de neumonia", ln=True)
+    pdf.cell(0, 10, "Reporte - Detector de neumonia", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.set_font("Helvetica", "", 11)
-    pdf.cell(0, 8, f"Archivo: {source_name}", ln=True)
-    pdf.cell(0, 8, f"Fecha: {datetime.now():%Y-%m-%d %H:%M}", ln=True)
-    pdf.cell(0, 8, f"Resultado: {label}", ln=True)
-    pdf.cell(0, 8, f"Probabilidad de neumonia: {prob:.1%}", ln=True)
-    pdf.cell(0, 8, f"Umbral usado: {threshold:.0%}", ln=True)
+    pdf.cell(0, 8, f"Archivo: {source_name}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.cell(0, 8, f"Fecha: {datetime.now():%Y-%m-%d %H:%M}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.cell(0, 8, f"Resultado: {label}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.cell(0, 8, f"Probabilidad de neumonia: {prob:.1%}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.cell(0, 8, f"Umbral usado: {threshold:.0%}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.ln(4)
 
     img_copy = image.convert("RGB").resize((300, 300))
@@ -203,7 +203,7 @@ def process_and_display(image: Image.Image, source_name: str, threshold: float, 
     col1, col2, col3 = st.columns([1, 1, 1])
 
     with col1:
-        st.image(image, caption="Radiografía", use_container_width=True)
+        st.image(image, caption="Radiografía", width="stretch")
 
     if show_cam:
         try:
@@ -212,13 +212,13 @@ def process_and_display(image: Image.Image, source_name: str, threshold: float, 
                 st.image(
                     overlay_heatmap(image, heatmap),
                     caption="Grad-CAM (zonas relevantes)",
-                    use_container_width=True,
+                    width="stretch",
                 )
         except Exception as e:
             col2.warning(f"No se pudo generar el mapa de calor: {e}")
 
     with col3:
-        st.plotly_chart(make_gauge(prob, threshold), use_container_width=True, key=f"gauge_{source_name}_{len(st.session_state.history)}")
+        st.plotly_chart(make_gauge(prob, threshold), width="stretch", key=f"gauge_{source_name}_{len(st.session_state.history)}")
 
     css_class = "result-pneumonia" if is_pneumonia else "result-normal"
     st.markdown(
@@ -271,7 +271,7 @@ with st.sidebar:
     any_sample_available = any(os.path.exists(p) for p in sample_files.values())
     if any_sample_available:
         for label, path in sample_files.items():
-            if os.path.exists(path) and st.button(label, use_container_width=True):
+            if os.path.exists(path) and st.button(label, width="stretch"):
                 sample_choice = path
     else:
         st.caption(
@@ -281,7 +281,7 @@ with st.sidebar:
 
     if st.session_state.history:
         st.divider()
-        if st.button("🗑️ Borrar historial", use_container_width=True):
+        if st.button("🗑️ Borrar historial", width="stretch"):
             st.session_state.history = []
             st.rerun()
 
@@ -324,4 +324,4 @@ if not uploaded_files and not sample_choice:
 if st.session_state.history:
     st.subheader("📋 Historial de esta sesión")
     df = pd.DataFrame(st.session_state.history[::-1])  # más reciente primero
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    st.dataframe(df, width="stretch", hide_index=True)
