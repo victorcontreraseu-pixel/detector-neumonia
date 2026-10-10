@@ -85,7 +85,10 @@ def load_model(path: str):
 # ---------------------------------------------------------------
 # Preprocesamiento: debe ser IGUAL al usado en el entrenamiento
 # ---------------------------------------------------------------
-def apply_clahe(image: Image.Image) -> Image.Image:
+def preprocess(image: Image.Image) -> np.ndarray:
+    image = image.convert("RGB").resize(IMG_SIZE, Image.BILINEAR)
+    arr = np.asarray(image, dtype=np.float32) / 255.0
+    return np.expand_dims(arr, axis=0)
     """Ecualiza el contraste localmente para que imágenes de distinta
     calidad/resolución se vean más parecidas entre sí antes de entrar al modelo."""
     gray = cv2.cvtColor(np.array(image.convert("RGB")), cv2.COLOR_RGB2GRAY)
@@ -120,7 +123,7 @@ def make_gradcam(model, img_array: np.ndarray) -> np.ndarray:
 
 
 def overlay_heatmap(image: Image.Image, heatmap: np.ndarray, alpha=0.4) -> Image.Image:
-    image = apply_clahe(image).resize(IMG_SIZE)
+       image = image.convert("RGB").resize(IMG_SIZE)
     heat = Image.fromarray(np.uint8(255 * heatmap)).resize(IMG_SIZE, Image.BILINEAR)
     colored = matplotlib.colormaps["jet"](np.asarray(heat) / 255.0)[:, :, :3]
     colored = np.uint8(255 * colored)
