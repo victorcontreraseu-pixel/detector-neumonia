@@ -6,3 +6,7 @@ matplotlib
 plotly
 pandas
 fpdf2
+opencv-python-headless
+sqlalchemy>=2.0
+psycopg2-binary
+tzdata
