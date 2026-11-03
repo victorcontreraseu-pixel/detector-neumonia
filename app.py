@@ -1,41 +1,68 @@
 import os
-import io
-import glob
-import hashlib
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 import tensorflow as tf
+from PIL import Image
 import matplotlib
+import cv2
 import plotly.graph_objects as go
-from PIL import Image, ImageOps
+import plotly.express as px
 from fpdf import FPDF, XPos, YPos
+
+import db
+import auth
 
 # ---------------------------------------------------------------
 # Configuración general
 # ---------------------------------------------------------------
+MODEL_PATH = os.environ.get("MODEL_PATH", "modelo_neumonia.keras")
 IMG_SIZE = (224, 224)
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
-SAMPLES_DIR = os.path.join(APP_DIR, "samples")
+LAST_CONV_LAYER = "out_relu"  # última capa convolucional de MobileNetV2
+SAMPLES_DIR = "samples"
 
 st.set_page_config(page_title="Detector de neumonía", page_icon="🫁", layout="wide")
 
+# ---------------------------------------------------------------
+# Base de datos + LOGIN (nada de lo de abajo se ejecuta sin sesión)
+# ---------------------------------------------------------------
+db.iniciar_db()
+sesion = auth.requerir_login()
+rol = sesion["rol"]
+
+# ---------------------------------------------------------------
+# Estilos propios (branding)
+# ---------------------------------------------------------------
 st.markdown(
     """
     <style>
         .app-header {
-            padding: 1.2rem 1.5rem; border-radius: 14px;
+            padding: 1.2rem 1.5rem;
+            border-radius: 14px;
             background: linear-gradient(90deg, #0f4c81 0%, #1a7fb3 100%);
-            color: #ffffff; margin-bottom: 0.8rem;
+            color: white;
+            margin-bottom: 1.2rem;
         }
-        .app-header h1 { margin: 0; font-size: 1.6rem; color: #ffffff; }
-        .app-header p { margin: 0.3rem 0 0 0; opacity: 0.92; font-size: 0.95rem; color: #ffffff; }
-        .result-card { padding: 1rem 1.2rem; border-radius: 12px; margin-top: 0.6rem; font-size: 1.05rem; }
-        .result-pneu { background: #fdecea; border: 1px solid #f5c2c0; color: #7a1f1a !important; }
-        .result-norm { background: #eaf7ee; border: 1px solid #bfe6c9; color: #1e5c31 !important; }
-        .result-unk  { background: #fff6dc; border: 1px solid #f0d98a; color: #6b5200 !important; }
+        .app-header h1 { margin: 0; font-size: 1.6rem; }
+        .app-header p { margin: 0.3rem 0 0 0; opacity: 0.9; font-size: 0.95rem; }
+        .result-card {
+            padding: 1rem 1.2rem;
+            border-radius: 12px;
+            margin-top: 0.5rem;
+            font-size: 1.05rem;
+        }
+        .result-pneumonia {
+            background-color: #fdecea;
+            border: 1px solid #f5c2c0;
+            color: #7a1f1a !important;
+        }
+        .result-normal {
+            background-color: #eaf7ee;
+            border: 1px solid #bfe6c9;
+            color: #1e5c31 !important;
+        }
         .result-card b { color: inherit; }
     </style>
     <div class="app-header">
@@ -46,392 +73,448 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# ---------------------------------------------------------------
-# Estado de sesión
-# ---------------------------------------------------------------
-if "history" not in st.session_state:
-    st.session_state.history = {}
-if "sample_path" not in st.session_state:
-    st.session_state.sample_path = None
-
 
 # ---------------------------------------------------------------
-# Modelo
+# Carga del modelo (una sola vez, en caché)
 # ---------------------------------------------------------------
-def find_model_path():
-    """Usa MODEL_PATH si existe; si no, toma el .keras con nombre más alto (v5 > v4 > v3)."""
-    env = os.environ.get("MODEL_PATH")
-    if env and os.path.exists(env):
-        return env
-    candidates = sorted(glob.glob(os.path.join(APP_DIR, "*.keras")))
-    return candidates[-1] if candidates else None
-
-
 @st.cache_resource(show_spinner="Cargando modelo...")
 def load_model(path: str):
-    return tf.keras.models.load_model(path, compile=False)
-
-
-def last_conv_layer_name(model):
-    try:
-        model.get_layer("out_relu")
-        return "out_relu"
-    except ValueError:
-        pass
-    for layer in reversed(model.layers):
-        shape = getattr(getattr(layer, "output", None), "shape", None)
-        if shape is not None and len(shape) == 4:
-            return layer.name
-    return None
+    return tf.keras.models.load_model(path)
 
 
 # ---------------------------------------------------------------
-# Imagen: lectura y preprocesamiento (igual que en el entrenamiento:
-# RGB, 224x224, bilinear, /255, sin CLAHE)
+# Preprocesamiento: debe ser IGUAL al usado en el entrenamiento
 # ---------------------------------------------------------------
-def open_image(data: bytes) -> Image.Image:
-    img = Image.open(io.BytesIO(data))
-    img = ImageOps.exif_transpose(img)
-    if img.mode in ("I;16", "I;16B", "I;16L", "I", "F"):
-        arr = np.asarray(img, dtype=np.float32)
-        rng = arr.max() - arr.min()
-        arr = (arr - arr.min()) / (rng + 1e-8) * 255.0
-        img = Image.fromarray(arr.astype(np.uint8))
-    return img.convert("RGB")
+def apply_clahe(image: Image.Image) -> Image.Image:
+    gray = cv2.cvtColor(np.array(image.convert("RGB")), cv2.COLOR_RGB2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    gray_eq = clahe.apply(gray)
+    return Image.fromarray(gray_eq).convert("RGB")
 
 
-def to_input(img: Image.Image, flip: bool = False) -> np.ndarray:
-    im = img.resize(IMG_SIZE, Image.BILINEAR)
-    if flip:
-        im = ImageOps.mirror(im)
-    arr = np.asarray(im, dtype=np.float32) / 255.0
+def preprocess(image: Image.Image) -> np.ndarray:
+    image = apply_clahe(image)
+    image = image.resize(IMG_SIZE, Image.BILINEAR)
+    arr = np.asarray(image, dtype=np.float32) / 255.0
     return np.expand_dims(arr, axis=0)
 
 
-def quality_notes(img: Image.Image):
-    notes = []
-    rgb = np.asarray(img, dtype=np.float32)
-    saturation = (rgb.max(axis=2) - rgb.min(axis=2)).mean()
-    if saturation > 18:
-        notes.append("La imagen tiene color marcado. Las radiografías suelen ser en escala de grises: "
-                     "¿es una foto o una captura de pantalla? Los resultados pueden ser poco confiables.")
-    w, h = img.size
-    if min(w, h) < 256:
-        notes.append(f"Resolución baja ({w}x{h}px). El modelo puede perder detalle.")
-    if max(w, h) / max(1, min(w, h)) > 1.5:
-        notes.append("Proporciones inusuales para una radiografía de tórax frontal. Revisa que no esté recortada.")
-    mean = rgb.mean()
-    if mean < 40:
-        notes.append("La imagen está muy oscura.")
-    elif mean > 215:
-        notes.append("La imagen está muy clara o sobreexpuesta.")
-    return notes
-
-
 # ---------------------------------------------------------------
-# Predicción y Grad-CAM (con caché para no recalcular en cada interacción)
+# Grad-CAM
 # ---------------------------------------------------------------
-@st.cache_data(show_spinner=False, max_entries=128)
-def predict_prob(data: bytes, use_tta: bool, model_path: str) -> float:
-    model = load_model(model_path)
-    img = open_image(data)
-    probs = [float(model.predict(to_input(img), verbose=0)[0][0])]
-    if use_tta:
-        probs.append(float(model.predict(to_input(img, flip=True), verbose=0)[0][0]))
-    return float(np.mean(probs))
-
-
-@st.cache_data(show_spinner=False, max_entries=64)
-def compute_heatmap(data: bytes, model_path: str):
-    model = load_model(model_path)
-    layer_name = last_conv_layer_name(model)
-    if layer_name is None:
-        return None
-    img = open_image(data)
-    arr = tf.convert_to_tensor(to_input(img))
+def make_gradcam(model, img_array: np.ndarray) -> np.ndarray:
     grad_model = tf.keras.models.Model(
-        model.inputs, [model.get_layer(layer_name).output, model.output]
+        inputs=model.inputs,
+        outputs=[model.get_layer(LAST_CONV_LAYER).output, model.output],
     )
     with tf.GradientTape() as tape:
-        conv_out, preds = grad_model(arr, training=False)
+        conv_out, preds = grad_model(img_array)
         target = preds[:, 0]
     grads = tape.gradient(target, conv_out)
     pooled = tf.reduce_mean(grads, axis=(0, 1, 2))
-    heat = tf.squeeze(conv_out[0] @ pooled[..., tf.newaxis])
-    heat = tf.maximum(heat, 0)
-    heat = heat / (tf.reduce_max(heat) + 1e-8)
-    return heat.numpy()
+    heatmap = tf.squeeze(conv_out[0] @ pooled[..., tf.newaxis])
+    heatmap = tf.maximum(heatmap, 0) / (tf.reduce_max(heatmap) + 1e-8)
+    return heatmap.numpy()
 
 
-def overlay(img: Image.Image, heat: np.ndarray, alpha: float = 0.4) -> Image.Image:
-    base = img.resize(IMG_SIZE, Image.BILINEAR)
-    h = Image.fromarray(np.uint8(255 * heat)).resize(IMG_SIZE, Image.BILINEAR)
-    colored = matplotlib.colormaps["jet"](np.asarray(h) / 255.0)[:, :, :3] * 255
-    blended = (1 - alpha) * np.asarray(base, dtype=np.float32) + alpha * colored
+def overlay_heatmap(image: Image.Image, heatmap: np.ndarray, alpha=0.4) -> Image.Image:
+    image = apply_clahe(image).resize(IMG_SIZE)
+    heat = Image.fromarray(np.uint8(255 * heatmap)).resize(IMG_SIZE, Image.BILINEAR)
+    colored = matplotlib.colormaps["jet"](np.asarray(heat) / 255.0)[:, :, :3]
+    colored = np.uint8(255 * colored)
+    blended = (1 - alpha) * np.asarray(image) + alpha * colored
     return Image.fromarray(np.uint8(blended))
 
 
 # ---------------------------------------------------------------
-# Decisión, medidor y reporte
+# Medidor visual (gauge)
 # ---------------------------------------------------------------
-def decide(prob: float, thr: float, margin: float):
-    if prob >= thr + margin:
-        return "NEUMONÍA", "pneu"
-    if prob <= thr - margin:
-        return "NORMAL", "norm"
-    return "INDETERMINADO", "unk"
-
-
-def make_gauge(prob: float, thr: float, margin: float) -> go.Figure:
-    lo = max(0.0, thr - margin) * 100
-    hi = min(1.0, thr + margin) * 100
+def make_gauge(prob: float, threshold: float) -> go.Figure:
     fig = go.Figure(
         go.Indicator(
             mode="gauge+number",
             value=prob * 100,
-            number={"suffix": "%", "valueformat": ".1f"},
+            number={"suffix": "%"},
             title={"text": "Probabilidad de neumonía"},
             gauge={
                 "axis": {"range": [0, 100]},
                 "bar": {"color": "#0f4c81"},
                 "steps": [
-                    {"range": [0, lo], "color": "#c9edd1"},
-                    {"range": [lo, hi], "color": "#fff1c2"},
-                    {"range": [hi, 100], "color": "#f7c9c7"},
+                    {"range": [0, threshold * 100], "color": "#c9edd1"},
+                    {"range": [threshold * 100, 100], "color": "#f7c9c7"},
                 ],
+                "threshold": {
+                    "line": {"color": "black", "width": 3},
+                    "thickness": 0.85,
+                    "value": threshold * 100,
+                },
             },
         )
     )
-    fig.update_layout(height=230, margin=dict(l=20, r=20, t=50, b=10), paper_bgcolor="rgba(0,0,0,0)")
+    fig.update_layout(height=220, margin=dict(l=20, r=20, t=40, b=10))
     return fig
 
 
-def latin(text: str) -> str:
-    return text.encode("latin-1", "replace").decode("latin-1")
+# ---------------------------------------------------------------
+# Reporte PDF (ahora incluye paciente y profesional)
+# ---------------------------------------------------------------
+def _l1(texto) -> str:
+    """fpdf con fuentes base solo admite latin-1."""
+    return str(texto).encode("latin-1", "replace").decode("latin-1")
 
 
-def build_pdf(img, heat_img, name, label, prob, thr, margin, model_name) -> bytes:
+def generate_pdf(image: Image.Image, datos: dict) -> bytes:
     pdf = FPDF()
     pdf.add_page()
     pdf.set_font("Helvetica", "B", 16)
-    pdf.cell(0, 10, latin("Reporte - Detector de neumonía"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.cell(0, 10, "Reporte - Detector de neumonia", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.set_font("Helvetica", "", 11)
-    lines = [
-        f"Archivo: {name}",
-        f"Fecha: {datetime.now():%Y-%m-%d %H:%M}",
-        f"Resultado: {label}",
-        f"Probabilidad de neumonía: {prob:.1%}",
-        f"Umbral: {thr:.2f} (zona indeterminada +/- {margin:.2f})",
-        f"Modelo: {model_name}",
+    lineas = [
+        f"Fecha: {datos['fecha']:%Y-%m-%d %H:%M}",
+        f"Paciente: {datos['paciente']}",
+        f"RUT: {db.formatear_rut(datos['rut'])}",
+        f"Edad: {datos['edad']}",
+        f"Archivo: {datos['archivo']}",
+        f"Resultado del modelo: {datos['resultado']}",
+        f"Probabilidad de neumonia: {datos['probabilidad']:.1%}  (umbral {datos['umbral']:.0%})",
+        f"Procesado por: {datos['profesional']} ({db.ROL_NOMBRE.get(datos['rol'], datos['rol'])})",
     ]
-    for line in lines:
-        pdf.cell(0, 7, latin(line), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.ln(3)
-    y = pdf.get_y()
-    pdf.image(img.resize((300, 300)), x=10, y=y, w=90)
-    if heat_img is not None:
-        pdf.image(heat_img.resize((300, 300)), x=105, y=y, w=90)
-    pdf.set_y(y + 95)
+    for l in lineas:
+        pdf.cell(0, 8, _l1(l), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.ln(2)
+
+    if datos["informe"]:
+        pdf.set_font("Helvetica", "B", 11)
+        pdf.cell(0, 8, "Informe / observaciones:", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.set_font("Helvetica", "", 11)
+        pdf.multi_cell(0, 6, _l1(datos["informe"]))
+        pdf.ln(2)
+
+    pdf.image(image.convert("RGB").resize((300, 300)), w=90)
+    pdf.ln(6)
     pdf.set_font("Helvetica", "I", 9)
     pdf.multi_cell(
-        0, 5,
-        latin("Este resultado lo genera un modelo automático con fines educativos y no reemplaza "
-              "el diagnóstico de un profesional de la salud. La probabilidad no es una medida clínica."),
-        new_x=XPos.LMARGIN, new_y=YPos.NEXT,
+        0, 6,
+        "Este resultado es generado por un modelo automatico con fines educativos "
+        "y no reemplaza el diagnostico de un profesional de la salud.",
     )
     return bytes(pdf.output())
 
 
-def record(key, name, prob, label, thr):
-    prev = st.session_state.history.get(key)
-    st.session_state.history[key] = {
-        "Archivo": name,
-        "Probabilidad": f"{prob:.1%}",
-        "Resultado": label,
-        "Umbral": f"{thr:.2f}",
-        "Hora": prev["Hora"] if prev else datetime.now().strftime("%H:%M:%S"),
-    }
+# ---------------------------------------------------------------
+# Predicción en caché de sesión (no se repite al guardar o cambiar de pestaña)
+# ---------------------------------------------------------------
+def get_prediccion(image: Image.Image, uid: str, show_cam: bool) -> dict:
+    cache = st.session_state.setdefault("pred", {})
+    p = cache.get(uid)
+    if p is None:
+        with st.spinner("Analizando..."):
+            prob = float(model.predict(preprocess(image), verbose=0)[0][0])
+        p = {"prob": prob, "heat": None, "heat_error": None}
+        cache[uid] = p
+    if show_cam and p["heat"] is None and p["heat_error"] is None:
+        try:
+            p["heat"] = make_gradcam(model, preprocess(image))
+        except Exception as e:
+            p["heat_error"] = str(e)
+    return p
+
+
+# ---------------------------------------------------------------
+# Bloque de resultados + formulario de registro de UNA imagen
+# ---------------------------------------------------------------
+def process_and_display(image: Image.Image, source_name: str, uid: str,
+                        threshold: float, show_cam: bool, es_ejemplo: bool = False):
+    p = get_prediccion(image, uid, show_cam)
+    prob = p["prob"]
+    is_pneumonia = prob >= threshold
+    label = "NEUMONÍA" if is_pneumonia else "NORMAL"
+    confidence = prob if is_pneumonia else 1 - prob
+
+    st.markdown(f"#### {source_name}")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.image(image, caption="Radiografía", width="stretch")
+    if show_cam:
+        if p["heat"] is not None:
+            col2.image(overlay_heatmap(image, p["heat"]),
+                       caption="Grad-CAM (zonas relevantes)", width="stretch")
+        elif p["heat_error"]:
+            col2.warning(f"No se pudo generar el mapa de calor: {p['heat_error']}")
+    with col3:
+        st.plotly_chart(make_gauge(prob, threshold), width="stretch", key=f"gauge_{uid}")
+
+    css_class = "result-pneumonia" if is_pneumonia else "result-normal"
+    st.markdown(
+        f'<div class="result-card {css_class}"><b>Resultado: {label}</b> — Confianza: {confidence:.1%}</div>',
+        unsafe_allow_html=True,
+    )
+
+    # ---- Registro del procesamiento ----
+    guardados = st.session_state.setdefault("guardados", {})
+
+    if es_ejemplo:
+        st.caption("Imagen de ejemplo: no se registra en la base de datos.")
+    elif uid in guardados:
+        d = guardados[uid]
+        st.success(f"✅ Registro guardado — {db.formatear_rut(d['rut'])} · {d['paciente']}")
+        st.download_button(
+            "📄 Descargar reporte PDF",
+            data=generate_pdf(image, d),
+            file_name=f"reporte_{d['rut']}_{d['fecha']:%Y%m%d_%H%M}.pdf",
+            mime="application/pdf",
+            key=f"pdf_{uid}",
+        )
+    else:
+        with st.form(f"form_{uid}"):
+            st.markdown("**Registrar procesamiento**")
+            c1, c2, c3 = st.columns([2, 3, 1])
+            rut = c1.text_input("RUT del paciente", placeholder="12.345.678-5")
+            paciente = c2.text_input("Nombre del paciente")
+            edad = c3.number_input("Edad", min_value=0, max_value=120, value=0)
+            informe = st.text_area("Informe / observaciones del profesional", height=100)
+            guardar = st.form_submit_button("💾 Guardar registro", type="primary")
+
+        if guardar:
+            if not db.rut_valido(rut):
+                st.error("RUT inválido. Revisa el número y el dígito verificador.")
+            elif not paciente.strip():
+                st.error("Ingresa el nombre del paciente.")
+            else:
+                datos = dict(
+                    fecha=db.ahora(), rut=db.normalizar_rut(rut), paciente=paciente.strip(),
+                    edad=int(edad), archivo=source_name, resultado=label, probabilidad=prob,
+                    umbral=threshold, usuario=sesion["usuario"], profesional=sesion["nombre"],
+                    rol=rol, informe=informe.strip(),
+                )
+                db.guardar_proceso(
+                    rut=datos["rut"], paciente=datos["paciente"], edad=datos["edad"],
+                    archivo=source_name, resultado=label, probabilidad=prob,
+                    umbral=threshold, sesion=sesion, informe=datos["informe"],
+                )
+                db.registrar_auditoria(sesion["usuario"], "REGISTRO", datos["rut"])
+                guardados[uid] = datos
+                st.rerun()
+    st.divider()
+
+
+# ---------------------------------------------------------------
+# Utilidad para mostrar tablas legibles
+# ---------------------------------------------------------------
+def tabla_legible(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    out = df.copy()
+    out["rut"] = out["rut"].map(db.formatear_rut)
+    out["probabilidad"] = (out["probabilidad"] * 100).round(1).astype(str) + "%"
+    out["rol"] = out["rol"].map(lambda r: db.ROL_NOMBRE.get(r, r))
+    cols = ["fecha", "rut", "paciente", "edad", "archivo", "resultado", "probabilidad",
+            "profesional", "rol", "informe"]
+    return out[cols]
 
 
 # ---------------------------------------------------------------
 # Barra lateral
 # ---------------------------------------------------------------
-model_path = find_model_path()
-
 with st.sidebar:
-    st.header("⚙️ Configuración")
-    thr = st.slider("Umbral de decisión", 0.10, 0.90, 0.50, 0.05,
-                    help="Probabilidad a partir de la cual el resultado se inclina a NEUMONÍA. "
-                         "Subirlo reduce falsos positivos, pero puede dejar pasar casos reales.")
-    margin = st.slider("Zona indeterminada (±)", 0.00, 0.25, 0.10, 0.05,
-                       help="Si la probabilidad cae cerca del umbral, el resultado se marca como "
-                            "INDETERMINADO en vez de forzar una respuesta.")
-    show_cam = st.checkbox("Mostrar mapa de calor (Grad-CAM)", value=True)
-    use_tta = st.checkbox("Promediar con imagen en espejo", value=False,
-                          help="Predice la imagen original y su espejo y promedia. Es más estable, pero un poco más lento.")
-
-    sample_files = []
-    if os.path.isdir(SAMPLES_DIR):
-        sample_files = sorted(
-            f for f in glob.glob(os.path.join(SAMPLES_DIR, "*"))
-            if f.lower().endswith((".png", ".jpg", ".jpeg"))
-        )[:6]
-    if sample_files:
-        st.divider()
-        st.header("🖼️ Imágenes de ejemplo")
-        for i, path in enumerate(sample_files):
-            if st.button(os.path.basename(path), key=f"sample_{i}", width="stretch"):
-                st.session_state.sample_path = path
-        if st.session_state.sample_path and st.button("Quitar ejemplo", key="sample_clear", width="stretch"):
-            st.session_state.sample_path = None
-            st.rerun()
+    st.markdown(f"👤 **{sesion['nombre']}**")
+    st.caption(db.ROL_NOMBRE.get(rol, rol))
+    if st.button("Cerrar sesión", width="stretch"):
+        auth.cerrar_sesion()
 
     st.divider()
-    if model_path:
-        st.caption(f"Modelo: `{os.path.basename(model_path)}`")
+    st.header("⚙️ Configuración")
+    threshold = st.slider(
+        "Umbral de decisión", min_value=0.10, max_value=0.90, value=0.50, step=0.05,
+        help="Si la probabilidad de neumonía supera este valor, se clasifica como NEUMONÍA.",
+    )
+    show_cam = st.checkbox("Mostrar mapa de calor (Grad-CAM)", value=True)
 
-if not model_path:
+    st.divider()
+    st.header("🖼️ Imágenes de ejemplo")
+    sample_files = {
+        "Ejemplo normal": os.path.join(SAMPLES_DIR, "normal.jpg"),
+        "Ejemplo con neumonía": os.path.join(SAMPLES_DIR, "pneumonia.jpg"),
+    }
+    if any(os.path.exists(p) for p in sample_files.values()):
+        for nombre_btn, path in sample_files.items():
+            if os.path.exists(path) and st.button(nombre_btn, width="stretch"):
+                st.session_state["sample"] = path
+        if st.session_state.get("sample") and st.button("Quitar ejemplo", width="stretch"):
+            st.session_state.pop("sample")
+            st.rerun()
+    else:
+        st.caption("Agrega imágenes en `samples/` (`normal.jpg`, `pneumonia.jpg`) para habilitar esta opción.")
+
+# ---------------------------------------------------------------
+# Modelo
+# ---------------------------------------------------------------
+if not os.path.exists(MODEL_PATH):
     st.error(
-        "No se encontró ningún archivo `.keras` junto a `app.py`. Sube tu modelo al repositorio "
-        "(por ejemplo `modelo_neumonia_v5.keras`) o define la variable de entorno MODEL_PATH."
+        f"No se encontró el modelo en `{MODEL_PATH}`. Copia `modelo_neumonia.keras` junto a "
+        "`app.py` o define la variable de entorno MODEL_PATH."
     )
     st.stop()
 
-model_name = os.path.basename(model_path)
-load_model(model_path)  # carga una sola vez (queda en caché)
-
+model = load_model(MODEL_PATH)
 
 # ---------------------------------------------------------------
-# Tarjeta de resultado de una imagen
+# Pestañas según perfil
 # ---------------------------------------------------------------
-def render_item(idx, name, data, expanded):
-    key = hashlib.md5(data).hexdigest()
-    img = open_image(data)
-    prob = predict_prob(data, use_tta, model_path)
-    label, kind = decide(prob, thr, margin)
-    record(key, name, prob, label, thr)
+nombres_tabs = auth.PERMISOS[rol]
+T = dict(zip(nombres_tabs, st.tabs(nombres_tabs)))
 
-    with st.expander(f"{name} — {label} ({prob:.1%})", expanded=expanded):
-        for note in quality_notes(img):
-            st.warning(note)
-
-        c1, c2, c3 = st.columns(3)
-        c1.image(img, caption="Radiografía", width="stretch")
-
-        heat_img = None
-        if show_cam:
-            try:
-                heat = compute_heatmap(data, model_path)
-                if heat is not None:
-                    heat_img = overlay(img, heat)
-                    c2.image(heat_img, caption="Grad-CAM (zonas relevantes)", width="stretch")
-            except Exception as e:
-                c2.warning(f"No se pudo generar el mapa de calor: {e}")
-
-        c3.plotly_chart(make_gauge(prob, thr, margin), width="stretch", key=f"gauge_{idx}_{key}")
-
-        if kind == "pneu":
-            text = f"<b>Resultado: NEUMONÍA (sospecha)</b> — Probabilidad: {prob:.1%}"
-        elif kind == "norm":
-            text = f"<b>Resultado: NORMAL</b> — Probabilidad de neumonía: {prob:.1%}"
-        else:
-            text = (f"<b>Resultado: INDETERMINADO</b> — Probabilidad: {prob:.1%}. "
-                    "El modelo no está seguro; conviene revisión profesional.")
-        st.markdown(f'<div class="result-card result-{kind}">{text}</div>', unsafe_allow_html=True)
-
-        pdf_bytes = build_pdf(img, heat_img, name, label, prob, thr, margin, model_name)
-        st.download_button(
-            "📄 Descargar reporte PDF",
-            data=pdf_bytes,
-            file_name=f"reporte_{os.path.splitext(name)[0]}.pdf",
-            mime="application/pdf",
-            key=f"pdf_{idx}_{key}",
-        )
-
-    return {"Archivo": name, "Probabilidad": f"{prob:.1%}", "Resultado": label}
-
-
-# ---------------------------------------------------------------
-# Pestañas
-# ---------------------------------------------------------------
-tab_analizar, tab_historial, tab_info = st.tabs(["🔍 Analizar", "📋 Historial", "ℹ️ Acerca del modelo"])
-
-with tab_analizar:
-    uploaded = st.file_uploader(
-        "Sube una o varias radiografías de tórax (frontales)",
+# ================= PROCESAR =================
+with T["Procesar"]:
+    uploaded_files = st.file_uploader(
+        "Sube una o varias radiografías de tórax",
         type=["jpg", "jpeg", "png"],
         accept_multiple_files=True,
     )
 
-    items = []
-    sp = st.session_state.sample_path
-    if sp and os.path.exists(sp):
-        with open(sp, "rb") as f:
-            items.append((os.path.basename(sp), f.read()))
-    for f in uploaded or []:
-        items.append((f.name, f.getvalue()))
+    sample_path = st.session_state.get("sample")
+    if sample_path and os.path.exists(sample_path):
+        process_and_display(Image.open(sample_path), os.path.basename(sample_path),
+                            f"sample_{os.path.basename(sample_path)}", threshold, show_cam,
+                            es_ejemplo=True)
 
-    if not items:
-        st.info("Sube una imagen para comenzar. Funciona mejor con radiografías de tórax frontales "
-                "(PA/AP), sin recortes y sin fotos de pantalla.")
+    for f in uploaded_files or []:
+        uid = f"{f.name}_{f.size}"
+        process_and_display(Image.open(f), f.name, uid, threshold, show_cam)
+
+    if not uploaded_files and not sample_path:
+        st.info("Sube una imagen para comenzar. Cada radiografía se registra con el RUT del paciente.")
+
+# ================= BUSCAR PACIENTE =================
+with T["Buscar paciente"]:
+    st.subheader("🔎 Buscar paciente por RUT")
+    rut_b = st.text_input("RUT", placeholder="12.345.678-5", key="rut_busqueda")
+    if rut_b:
+        if not db.rut_valido(rut_b):
+            st.error("RUT inválido.")
+        else:
+            res = db.buscar_por_rut(rut_b)
+            db.registrar_auditoria(sesion["usuario"], "CONSULTA_RUT", db.normalizar_rut(rut_b))
+            if res.empty:
+                st.info("Este RUT no tiene procesamientos registrados.")
+            else:
+                st.markdown(f"**{res.iloc[0]['paciente']}** — {db.formatear_rut(rut_b)} · "
+                            f"{len(res)} procesamiento(s)")
+                st.dataframe(tabla_legible(res), width="stretch", hide_index=True)
+
+# ================= INFORMES =================
+with T["Informes"]:
+    st.subheader("📋 Informes y registros")
+    c1, c2, c3 = st.columns(3)
+    hoy = db.ahora().date()
+    desde = c1.date_input("Desde", hoy - timedelta(days=30), key="inf_desde")
+    hasta = c2.date_input("Hasta", hoy, key="inf_hasta")
+
+    if rol == "tecnologo":
+        usuario_filtro = sesion["usuario"]
+        c3.caption("Se muestran solo tus registros.")
     else:
-        summary = st.container()
-        rows = []
-        for idx, (name, data) in enumerate(items):
-            try:
-                rows.append(render_item(idx, name, data, expanded=len(items) == 1))
-            except Exception as e:
-                st.error(f"No se pudo procesar {name}: {e}")
-        if len(rows) > 1:
-            with summary:
-                st.subheader("Resumen del lote")
-                df = pd.DataFrame(rows)
-                st.dataframe(df, width="stretch", hide_index=True)
-                st.download_button(
-                    "⬇️ Descargar resumen (CSV)",
-                    data=df.to_csv(index=False).encode("utf-8-sig"),
-                    file_name="resumen_lote.csv",
-                    mime="text/csv",
-                    key="csv_lote",
-                )
+        lista = db.listar_usuarios()
+        opciones = ["(todos)"] + lista["usuario"].tolist()
+        elegido = c3.selectbox("Profesional", opciones)
+        usuario_filtro = None if elegido == "(todos)" else elegido
 
-with tab_historial:
-    if st.session_state.history:
-        hist = pd.DataFrame(list(st.session_state.history.values())[::-1])
-        st.dataframe(hist, width="stretch", hide_index=True)
+    df = db.procesos_df(desde, hasta, usuario_filtro)
+    if df.empty:
+        st.info("Sin registros para el filtro seleccionado.")
+    else:
+        vista = tabla_legible(df)
+        st.dataframe(vista, width="stretch", hide_index=True)
+        st.download_button("⬇️ Descargar CSV", vista.to_csv(index=False).encode("utf-8-sig"),
+                           "informes.csv", "text/csv")
+
+# ================= ESTADÍSTICA =================
+if "Estadística" in T:
+    with T["Estadística"]:
+        st.subheader("📊 Estadística")
         c1, c2 = st.columns(2)
-        c1.download_button(
-            "⬇️ Descargar historial (CSV)",
-            data=hist.to_csv(index=False).encode("utf-8-sig"),
-            file_name="historial.csv",
-            mime="text/csv",
-            key="csv_hist",
-        )
-        if c2.button("🗑️ Borrar historial", key="clear_hist"):
-            st.session_state.history = {}
-            st.rerun()
-    else:
-        st.info("Aún no has analizado imágenes en esta sesión.")
+        hoy = db.ahora().date()
+        desde = c1.date_input("Desde", hoy - timedelta(days=30), key="est_desde")
+        hasta = c2.date_input("Hasta", hoy, key="est_hasta")
+        df = db.procesos_df(desde, hasta)
 
-with tab_info:
-    st.markdown(
-        """
-**Qué hace:** clasifica una radiografía de tórax frontal como *normal* o con *sospecha de neumonía*,
-y muestra con un mapa de calor (Grad-CAM) qué zonas influyeron en la decisión.
+        if df.empty:
+            st.info("Aún no hay datos en el período seleccionado.")
+        else:
+            total = len(df)
+            neum = int((df["resultado"] == "NEUMONÍA").sum())
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Total procesados", total)
+            m2.metric("Neumonía", neum)
+            m3.metric("Normal", total - neum)
+            m4.metric("% neumonía", f"{neum / total:.1%}")
 
-**Cómo leer el resultado**
-- La probabilidad **no está calibrada**: 80 % no significa que haya un 80 % de riesgo clínico.
-- **INDETERMINADO** significa que el modelo no está seguro. Es preferible a forzar una respuesta.
-- El umbral y la zona indeterminada se ajustan en la barra lateral.
-- Si el mapa de calor se concentra fuera de los pulmones (bordes, texto, esquinas), desconfía del resultado.
+            g1, g2 = st.columns(2)
+            por_prof = df.groupby("profesional").size().reset_index(name="procesados")
+            g1.plotly_chart(px.bar(por_prof, x="profesional", y="procesados",
+                                   title="Procesamientos por profesional"), width="stretch")
+            por_res = df.groupby("resultado").size().reset_index(name="casos")
+            g2.plotly_chart(px.pie(por_res, names="resultado", values="casos",
+                                   title="Distribución de resultados"), width="stretch")
 
-**Limitaciones**
-- Entrenado con radiografías pediátricas y de adultos de datasets públicos; puede rendir distinto con
-  otros equipos, hospitales, proyecciones (AP/PA) o poblaciones.
-- Puede dar falsos positivos con estructuras normales que se superponen, y falsos negativos.
-- No detecta otras enfermedades. No es un dispositivo médico.
+            df["dia"] = pd.to_datetime(df["fecha"]).dt.date
+            por_dia = df.groupby(["dia", "resultado"]).size().reset_index(name="casos")
+            st.plotly_chart(px.bar(por_dia, x="dia", y="casos", color="resultado",
+                                   title="Procesamientos por día"), width="stretch")
 
-**Privacidad:** la app procesa las imágenes en memoria y no las guarda en disco. Aun así, no subas
-radiografías con datos identificables de pacientes sin autorización.
-        """
-    )
+            cruce = pd.crosstab(df["profesional"], df["resultado"]).reset_index()
+            st.markdown("**Resultados por profesional**")
+            st.dataframe(cruce, width="stretch", hide_index=True)
+
+# ================= ADMINISTRACIÓN =================
+if "Administración" in T:
+    with T["Administración"]:
+        st.subheader("👥 Usuarios")
+        usuarios_df = db.listar_usuarios()
+        st.dataframe(usuarios_df, width="stretch", hide_index=True)
+
+        a1, a2 = st.columns(2)
+        with a1:
+            with st.form("nuevo_usuario", clear_on_submit=True):
+                st.markdown("**Crear usuario**")
+                nu = st.text_input("Usuario (para ingresar)")
+                nn = st.text_input("Nombre completo")
+                nr = st.selectbox("Perfil", db.ROLES, format_func=lambda r: db.ROL_NOMBRE[r])
+                nc = st.text_input("Clave inicial (mín. 8 caracteres)", type="password")
+                if st.form_submit_button("Crear"):
+                    if not nu.strip() or not nn.strip() or len(nc) < 8:
+                        st.error("Completa todos los campos (clave de al menos 8 caracteres).")
+                    else:
+                        try:
+                            db.crear_usuario(nu.strip(), nc, nn.strip(), nr)
+                            db.registrar_auditoria(sesion["usuario"], "CREAR_USUARIO", nu.strip())
+                            st.success("Usuario creado.")
+                            st.rerun()
+                        except Exception:
+                            st.error("Ese nombre de usuario ya existe.")
+        with a2:
+            with st.form("gestion_usuario"):
+                st.markdown("**Activar / desactivar / cambiar clave**")
+                sel = st.selectbox("Usuario", usuarios_df["usuario"].tolist())
+                nueva = st.text_input("Nueva clave (opcional)", type="password")
+                accion = st.radio("Acción", ["Solo cambiar clave", "Activar", "Desactivar"], horizontal=True)
+                if st.form_submit_button("Aplicar"):
+                    if accion == "Desactivar" and sel == sesion["usuario"]:
+                        st.error("No puedes desactivar tu propia cuenta.")
+                    else:
+                        if nueva:
+                            if len(nueva) < 8:
+                                st.error("La clave debe tener al menos 8 caracteres.")
+                                st.stop()
+                            db.reset_clave(sel, nueva)
+                        if accion == "Activar":
+                            db.set_activo(sel, True)
+                        elif accion == "Desactivar":
+                            db.set_activo(sel, False)
+                        db.registrar_auditoria(sesion["usuario"], "GESTION_USUARIO", f"{sel}: {accion}")
+                        st.success("Cambios aplicados.")
+                        st.rerun()
+
+        st.divider()
+        st.subheader("🧾 Auditoría (últimos 500 eventos)")
+        st.dataframe(db.ver_auditoria(), width="stretch", hide_index=True)
