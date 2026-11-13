@@ -1,0 +1,20 @@
+{
+  "version": "v5",
+  "backbone": "EfficientNetV2B0",
+  "img_size": 384,
+  "clases": [
+    "NORMAL",
+    "NEUMONIA"
+  ],
+  "clahe_clip": 2.0,
+  "clahe_tile": 8,
+  "entrada": "gris -> redimensionar sin deformar -> CLAHE -> lienzo cuadrado -> 3 canales, valores 0-255 SIN dividir por 255",
+  "calibracion": {
+    "a": 0.886475510107131,
+    "b": -0.06101661654530306
+  },
+  "umbral_youden": 0.4874615319415772,
+  "umbral_sens90": 0.5581755327758086,
+  "capa_gradcam": "top_activation",
+  "capa_logit": "logit"
+}
